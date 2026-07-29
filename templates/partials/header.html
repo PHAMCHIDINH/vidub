@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{.Title}} — vidub</title>
+  <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+  <script src="https://unpkg.com/htmx.org@1.9.10/dist/ext/sse.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; }
+    a { color: #58a6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* Dashboard layout */
+    .dashboard { display: flex; min-height: 100vh; }
+
+    /* Sidebar */
+    .sidebar { width: 260px; background: #161b22; border-right: 1px solid #30363d; padding: 1.5rem 1rem; display: flex; flex-direction: column; flex-shrink: 0; }
+    .sidebar .brand { font-size: 1.2rem; font-weight: 700; color: #58a6ff; margin-bottom: 1.5rem; }
+    .sidebar nav { display: flex; flex-direction: column; gap: 0.3rem; }
+    .sidebar nav a { padding: 0.4rem 0.8rem; border-radius: 6px; color: #c9d1d9; font-size: 0.9rem; }
+    .sidebar nav a:hover, .sidebar nav a.active { background: #21262d; text-decoration: none; }
+    .sidebar hr { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
+    .sidebar-section { font-size: 0.75rem; text-transform: uppercase; color: #8b949e; margin-bottom: 0.5rem; padding: 0 0.8rem; letter-spacing: 0.05em; }
+    #job-history { display: flex; flex-direction: column; gap: 0.2rem; }
+    .history-item { padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; font-size: 0.85rem; display: flex; align-items: center; gap: 0.5rem; }
+    .history-item:hover { background: #21262d; }
+    .history-item .badge { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .badge.running { background: #1f6feb; animation: pulse 1.5s infinite; }
+    .badge.done { background: #238636; }
+    .badge.failed { background: #da3633; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+    /* Main content */
+    .content { flex: 1; padding: 2rem; max-width: 900px; overflow-y: auto; }
+
+    /* Cards */
+    h1 { color: #58a6ff; margin-bottom: 0.5rem; font-size: 1.4rem; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.5rem; margin-bottom: 1rem; }
+
+    /* Form */
+    form { display: flex; flex-direction: column; gap: 1rem; }
+    label { font-weight: 600; font-size: 0.9rem; }
+    input, select, button { padding: 0.6rem; border-radius: 6px; border: 1px solid #30363d; background: #0d1117; color: #c9d1d9; font-size: 0.9rem; }
+    button { background: #238636; border-color: #238636; cursor: pointer; font-weight: 600; color: #fff; }
+    button:hover { background: #2ea043; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .muted { color: #8b949e; font-size: 0.85rem; }
+
+    /* Pipeline view */
+    .pipeline-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+    .pipeline-header .job-id { font-family: monospace; color: #58a6ff; font-size: 0.9rem; }
+
+    /* Timeline */
+    .timeline { position: relative; }
+    .tl-entry { display: flex; gap: 1rem; padding: 0.6rem 0; border-left: 2px solid #21262d; margin-left: 0.5rem; padding-left: 1.2rem; position: relative; }
+    .tl-entry:first-child { border-left-color: #1f6feb; }
+    .tl-entry.done { border-left-color: #238636; }
+    .tl-entry.failed { border-left-color: #da3633; }
+    .tl-entry::before { content: ''; position: absolute; left: -5px; top: 0.9rem; width: 8px; height: 8px; border-radius: 50%; background: #21262d; }
+    .tl-entry:first-child::before { background: #1f6feb; animation: pulse 1.5s infinite; }
+    .tl-entry.done::before { background: #238636; animation: none; }
+    .tl-entry.failed::before { background: #da3633; animation: none; }
+    .tl-time { color: #8b949e; font-size: 0.8rem; white-space: nowrap; min-width: 4.5rem; font-family: monospace; }
+    .tl-body { flex: 1; }
+    .tl-step { font-weight: 600; font-size: 0.9rem; text-transform: capitalize; }
+    .tl-msg { font-size: 0.8rem; color: #8b949e; }
+    .tl-elapsed { font-size: 0.8rem; color: #58a6ff; margin-left: 0.5rem; }
+
+    /* Progress bar */
+    progress { width: 100%; height: 0.5rem; border-radius: 4px; border: none; background: #21262d; }
+    progress::-webkit-progress-bar { background: #21262d; border-radius: 4px; }
+    progress::-webkit-progress-value { background: #1f6feb; border-radius: 4px; }
+
+    /* Downloads */
+    .downloads { display: flex; gap: 0.5rem; margin-top: 1rem; flex-wrap: wrap; }
+    .download-btn { display: inline-block; padding: 0.5rem 1rem; background: #238636; color: #fff; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 0.85rem; }
+    .download-btn:hover { background: #2ea043; text-decoration: none; }
+
+    /* Spinner */
+    .htmx-indicator { opacity: 0; transition: opacity 0.2s; }
+    .htmx-request .htmx-indicator { opacity: 1; }
+    .htmx-request button.submit-btn { opacity: 0.7; }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0d1117; }
+    ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+
+    /* Responsive */
+    @media (max-width: 768px) {
+      .dashboard { flex-direction: column; }
+      .sidebar { width: 100%; border-right: none; border-bottom: 1px solid #30363d; padding: 1rem; }
+      .content { padding: 1rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="dashboard">
+    <aside class="sidebar">
+      <div class="brand">🎬 vidub</div>
+      <nav>
+        <a href="/" class="active">New Job</a>
+      </nav>
+      <hr>
+      <div class="sidebar-section">History</div>
+      <div id="job-history"></div>
+    </aside>
+    <main class="content">
+
+<script>
+(function() {
+  var currentJobId = null;
+
+  function loadHistory() {
+    try { return JSON.parse(localStorage.getItem('vidub_jobs') || '[]'); } catch(e) { return []; }
+  }
+
+  function saveToHistory(jobId, url, status) {
+    var jobs = loadHistory().filter(function(j) { return j.id !== jobId; });
+    jobs.unshift({ id: jobId, url: url, status: status, ts: Date.now() });
+    jobs = jobs.slice(0, 20);
+    localStorage.setItem('vidub_jobs', JSON.stringify(jobs));
+    renderHistory();
+  }
+
+  function renderHistory() {
+    var jobs = loadHistory();
+    var el = document.getElementById('job-history');
+    if (!el) return;
+    el.innerHTML = jobs.map(function(j) {
+      var cls = j.status === 'running' ? 'running' : (j.status === 'failed' ? 'failed' : 'done');
+      return '<div class="history-item" data-job="' + j.id + '">' +
+        '<span class="badge ' + cls + '"></span>' +
+        '<span title="' + j.url + '">' + j.id + '</span>' +
+        '</div>';
+    }).join('');
+  }
+
+  function addTimelineEntry(log) {
+    var tl = document.getElementById('timeline');
+    if (!tl) return;
+
+    var entries = tl.querySelectorAll('.tl-entry');
+    entries.forEach(function(e) {
+      if (e.dataset.step === log.step) { e.classList.add('done'); }
+      var dot = e.querySelector('::before');
+    });
+
+    var cls = log.status === 'completed' ? 'done' : (log.status === 'failed' ? 'failed' : '');
+    var icon = log.status === 'completed' ? '&#10003;' : (log.status === 'failed' ? '&#10007;' : '&#9654;');
+    var elapsedHtml = log.elapsed > 0 ? '<span class="tl-elapsed">' + log.elapsed.toFixed(1) + 's</span>' : '';
+
+    var html = '<div class="tl-entry ' + cls + '" data-step="' + log.step + '">' +
+      '<span class="tl-time">' + log.time + '</span>' +
+      '<div class="tl-body">' +
+        '<span class="tl-step">' + icon + ' ' + log.step + elapsedHtml + '</span>' +
+        '<div class="tl-msg">' + log.message + '</div>' +
+      '</div>' +
+    '</div>';
+    tl.insertAdjacentHTML('beforeend', html);
+  }
+
+  function showPipeline() {
+    document.getElementById('pipeline-view').style.display = 'block';
+  }
+
+  function showResults(html) {
+    var res = document.getElementById('results');
+    res.innerHTML = html;
+    res.style.display = 'block';
+    if (currentJobId) saveToHistory(currentJobId, '', 'done');
+  }
+
+  function showError(html) {
+    var res = document.getElementById('results');
+    res.innerHTML = html;
+    res.style.display = 'block';
+    if (currentJobId) saveToHistory(currentJobId, '', 'failed');
+  }
+
+  document.body.addEventListener('htmx:sseMessage', function(e) {
+    var type = e.detail.type;
+    var data = e.detail.data;
+
+    if (type === 'step_log') {
+      try {
+        var log = JSON.parse(data);
+        addTimelineEntry(log);
+      } catch(err) { console.log('step_log parse error:', err); }
+    }
+
+    if (type === 'job_complete') {
+      showResults(decodeURIComponent(data));
+    }
+
+    if (type === 'job_error') {
+      showError(decodeURIComponent(data));
+    }
+  });
+
+  document.body.addEventListener('htmx:beforeRequest', function(e) {
+    var form = document.getElementById('job-form');
+    if (form && e.detail.elt && form.contains(e.detail.elt)) {
+      var urlInput = form.querySelector('input[name="url"]');
+      var videoId = extractVideoId(urlInput ? urlInput.value : '');
+      if (videoId) {
+        currentJobId = videoId;
+        saveToHistory(videoId, urlInput.value, 'running');
+        document.getElementById('timeline').innerHTML = '';
+        document.getElementById('pipeline-view').style.display = 'block';
+        document.getElementById('results').style.display = 'none';
+        document.getElementById('results').innerHTML = '';
+      }
+    }
+  });
+
+  function extractVideoId(url) {
+    var patterns = [
+      /youtube\.com\/watch\?.*v=([A-Za-z0-9_-]{11})/,
+      /youtu\.be\/([A-Za-z0-9_-]{11})/,
+      /youtube\.com\/embed\/([A-Za-z0-9_-]{11})/,
+      /youtube\.com\/shorts\/([A-Za-z0-9_-]{11})/,
+    ];
+    for (var i = 0; i < patterns.length; i++) {
+      var m = url.match(patterns[i]);
+      if (m) return m[1];
+    }
+    if (/^[A-Za-z0-9_-]{11}$/.test(url)) return url;
+    return 'unknown';
+  }
+
+  renderHistory();
+})();
+</script>

@@ -1,0 +1,44 @@
+{{template "partials/header" .}}
+
+<h1>🎬 vidub</h1>
+<p class="muted" style="margin-bottom:1.5rem">Video dubbing made simple — no GPU required.</p>
+
+<div id="job-form" class="card">
+  <h2 style="margin-bottom:1rem;font-size:1.1rem">New Dubbing Job</h2>
+  <p class="muted" style="margin-bottom:1rem">Using <strong>Google Translate</strong> by default. Add a DeepSeek key for higher quality.</p>
+  <form hx-post="/jobs" hx-target="#pipeline-view" hx-swap="innerHTML" hx-indicator="#spinner">
+    <label for="url">YouTube URL</label>
+    <input type="url" id="url" name="url" placeholder="https://www.youtube.com/watch?v=..." required>
+
+    <div style="cursor:pointer;color:#58a6ff;font-size:0.85rem;margin-top:-0.5rem" onclick="var el=document.getElementById('advanced-opts');el.style.display=el.style.display==='none'?'block':'none'">
+      ⚙ Advanced options ▾
+    </div>
+    <div id="advanced-opts" style="display:none">
+      <label for="apikey">DeepSeek API Key <span class="muted">(optional)</span></label>
+      <input type="password" id="apikey" name="apikey" placeholder="sk-..." value="{{.APIKey}}">
+
+      <label for="voice">Voice</label>
+      <select id="voice" name="voice">
+        {{range .Voices}}<option value="{{.ID}}" {{if eq .ID $.DefaultVoice}}selected{{end}}>{{.Label}}</option>{{end}}
+      </select>
+    </div>
+
+    <label for="mode">Mix Mode</label>
+    <select id="mode" name="mode">
+      <option value="voiceover">Voiceover (keep original audio 15%)</option>
+      <option value="replace">Replace (TTS only)</option>
+    </select>
+
+    <button type="submit" class="submit-btn">Start Dubbing</button>
+  </form>
+  <div id="spinner" class="htmx-indicator muted" style="margin-top:0.5rem">Starting pipeline...</div>
+</div>
+
+<div id="pipeline-view"></div>
+
+<p class="muted" style="margin-top:2rem">
+  Powered by <strong>Google Translate</strong> / <strong>DeepSeek</strong> +
+  <strong>Edge TTS</strong> for speech synthesis.
+</p>
+
+{{template "partials/footer" .}}
