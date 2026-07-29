@@ -100,40 +100,6 @@ func main() {
 		})
 	})
 
-	app.Get("/jobs/:id", func(c *fiber.Ctx) error {
-		videoID := c.Params("id")
-		rawURL := c.Query("url")
-		mode := c.Query("mode", "voiceover")
-		voice := c.Query("voice", cfg.TTSVoice)
-		apikey := c.Query("apikey")
-		if apikey == "" {
-			apikey = cfg.DeepSeekAPIKey
-		}
-
-		workDir := filepath.Join(cfg.StorageDir, videoID)
-
-		job := pipeline.VideoJob{
-			VideoID:  videoID,
-			URL:      rawURL,
-			Mode:     mode,
-			Voice:    voice,
-			APIKey:   apikey,
-			WorkDir:  workDir,
-		}
-
-		go func() {
-			if _, err := pl.Run(context.Background(), job); err != nil {
-				log.Printf("[job %s] pipeline error: %v", videoID, err)
-			}
-		}()
-
-		return c.Render("job_progress", fiber.Map{
-			"Title":   "Job " + videoID,
-			"VideoID": videoID,
-			"URL":     rawURL,
-		})
-	})
-
 	app.Get("/sse/jobs/:id", broker.SSEHandler)
 
 	app.Get("/jobs/:id/files/:filename", func(c *fiber.Ctx) error {

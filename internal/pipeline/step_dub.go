@@ -51,12 +51,12 @@ func (p *Pipeline) stepDub(ctx context.Context, job *VideoJob) error {
 
 	alignedNarrative := narrativePath
 	if hasNarrative {
-		alignedNarrative = alignAudioToVideo(job, narrativePath, videoPath, videoDur)
+		alignedNarrative = alignAudioToVideo(job, narrativePath, videoDur)
 	}
 
 	alignedDub := dubPath
 	if hasDub {
-		alignedDub = alignAudioToVideo(job, dubPath, videoPath, videoDur)
+		alignedDub = alignAudioToVideo(job, dubPath, videoDur)
 	}
 
 	subs := ""
@@ -146,7 +146,7 @@ func generateSubtitle(translatedPath, outputPath string) error {
 	return media.GenerateSRT(segments, outputPath)
 }
 
-func alignAudioToVideo(job *VideoJob, audioPath, videoPath string, videoDur float64) string {
+func alignAudioToVideo(job *VideoJob, audioPath string, videoDur float64) string {
 	dur, err := media.GetVideoDuration(audioPath, "")
 	if err != nil || dur <= videoDur {
 		return audioPath

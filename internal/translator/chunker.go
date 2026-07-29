@@ -53,7 +53,6 @@ func ChunkTranscript(segments []Segment, targetWords int, maxWords int, maxDurat
 	var currentSegments []Segment
 	currentWordCount := 0
 	currentDuration := 0.0
-	lastSplitIndex := 0 // index in segments where the last chunk ended
 
 	for i, seg := range segments {
 		wordCount := countWords(seg.Text)
@@ -93,7 +92,6 @@ func ChunkTranscript(segments []Segment, targetWords int, maxWords int, maxDurat
 			chunkSegs := currentSegments[:splitIndex]
 			if len(chunkSegs) > 0 {
 				chunks = append(chunks, Chunk{Segments: chunkSegs})
-				lastSplitIndex += len(chunkSegs)
 			}
 
 			// Keep the remaining segments (after the split) for the next chunk.

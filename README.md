@@ -2,9 +2,19 @@
 
 Dự án lồng tiếng video YouTube tự động sang tiếng Việt. Zero GPU, zero database, zero queue — chỉ cần 1 Go binary + Python scripts.
 
-**Pipeline:** Extract transcript → Translate (DeepSeek) → TTS (Edge TTS) → Download video → Dub (FFmpeg)
+**Pipeline:** Extract ∥ Download → Translate → TTS (narrative ∥ dub) → Dub (voiceover ∥ replacement) → Upload (optional)
 
 ![demo](images/screenshot.png)
+
+## Tính năng
+
+- **Dịch tự động** — Google Translate (free, mặc định) hoặc DeepSeek API (chất lượng cao)
+- **2 chế độ lồng tiếng** — Voiceover (giữ audio gốc 15%) hoặc Replace (chỉ TTS)
+- **Phụ đề hardcode** — Burn subtitle SRT tiếng Việt trực tiếp vào video
+- **Real-time dashboard** — Timeline log từng bước với timestamp + duration
+- **Concurrency** — Download∥Extract, narrative∥dub TTS, voiceover∥replacement mix
+- **Google Drive upload** — Tự động upload output lên Drive (optional)
+- **File-based checkpoint** — Job bị ngắt có thể resume từ step chưa xong
 
 ## Yêu cầu hệ thống
 
@@ -12,9 +22,11 @@ Dự án lồng tiếng video YouTube tự động sang tiếng Việt. Zero GPU
 |---|---|---|
 | Go 1.22+ | ✅ | Build server |
 | Python 3.12+ | ✅ | Chạy scripts extract + TTS |
-| FFmpeg | ✅ | Xử lý audio/video |
+| FFmpeg (libopenh264) | ✅ | Xử lý audio/video |
 | yt-dlp | ✅ | Tải video YouTube |
-| DeepSeek API key | ✅ | Dịch transcript (đăng ký miễn phí tại [platform.deepseek.com](https://platform.deepseek.com)) |
+| gcc-c++ | ✅ | Build numpy từ source (Python 3.14) |
+
+**Lưu ý Fedora:** FFmpeg mặc định không có `libx264`, vidub dùng `libopenh264` thay thế.
 
 ## Cài đặt
 
@@ -29,52 +41,96 @@ pip install -r requirements.txt
 go build -o vidub .
 
 # Kiểm tra tool system
-which ffmpeg yt-dlp python3
+which ffmpeg ffprobe yt-dlp python3
 ```
 
 ## Chạy
 
 ```bash
-# Optional: set API key và voice default
-export DEEPSEEK_API_KEY=sk-your-key-here
-export TTS_VOICE=vi-VN-HoaiMyNeural
+# Start server (Google Translate mặc định, không cần API key)
+./vidub
 
-# Start server
+# Hoặc với DeepSeek API (chất lượng dịch cao hơn)
+export DEEPSEEK_API_KEY=sk-your-key-here
 ./vidub
 ```
 
-Truy cập **http://localhost:8080**, dán YouTube URL, chọn giọng đọc, nhập API key (nếu chưa set env), bấm **Start Dubbing**.
+Truy cập **http://localhost:8080**, dán YouTube URL, chọn chế độ mix, bấm **Start Dubbing**.
 
-### Cấu hình qua biến môi trường
+### Google Drive upload (optional)
+
+```bash
+export GOOGLE_DRIVE_ENABLED=true
+export GOOGLE_DRIVE_CREDENTIALS=/path/to/service-account.json
+export GOOGLE_DRIVE_FOLDER=vidub
+./vidub
+```
+
+Cần tạo Service Account trên [Google Cloud Console](https://console.cloud.google.com) và download JSON key.
+
+## Cấu hình
 
 | Biến | Default | Mô tả |
 |---|---|---|
 | `PORT` | `8080` | HTTP port |
 | `STORAGE_DIR` | `./data` | Thư mục lưu artifacts |
-| `DEEPSEEK_API_KEY` | (trống) | DeepSeek API key |
+| `DEEPSEEK_API_KEY` | (trống) | DeepSeek API key (để trống → dùng Google Translate) |
 | `DEEPSEEK_MODEL` | `deepseek-v4-flash` | Model dịch |
 | `TTS_VOICE` | `vi-VN-HoaiMyNeural` | Giọng đọc mặc định |
-| `AUDIO_BITRATE` | `128k` | Bitrate audio output |
-
-Tất cả config đều có thể override trực tiếp trên giao diện web khi tạo job.
+| `GOOGLE_DRIVE_ENABLED` | `false` | Bật upload Google Drive |
+| `GOOGLE_DRIVE_CREDENTIALS` | `.commandcode/gdrive-credentials.json` | Path đến Service Account JSON |
+| `GOOGLE_DRIVE_FOLDER` | `vidub` | Tên folder gốc trên Drive |
 
 ## Pipeline
 
 ```
-┌─────────┐    ┌───────────┐    ┌─────┐    ┌──────────┐    ┌─────┐
-│ extract │───▶│ translate │───▶│ tts │───▶│ download │───▶│ dub │
-└─────────┘    └───────────┘    └─────┘    └──────────┘    └─────┘
- Python          Go (DeepSeek)   Python      yt-dlp        FFmpeg
- (yt API)                       (Edge TTS)
+┌──────────────────────────────────────────────────────────────┐
+│                    CONCURRENT STEP 1                         │
+│  ┌─────────┐              ┌──────────┐                       │
+│  │ extract │ ───────────▶ │ download │  (song song, I/O)     │
+│  └─────────┘              └──────────┘                       │
+└──────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌──────────────────────────────────────────────────────────────┐
+│                      STEP 2: translate                       │
+│  Google Translate RPC (free) hoặc DeepSeek API               │
+│  Chunking ≤12s + 5 workers song song                         │
+└──────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌──────────────────────────────────────────────────────────────┐
+│                CONCURRENT STEP 3: tts                        │
+│  ┌──────────────┐        ┌──────────────┐                    │
+│  │ narrative.mp3│        │  dub.mp3     │  (2 process Python)│
+│  │ (đọc liên tục)│       │ (sync timestamp)│                  │
+│  └──────────────┘        └──────────────┘                    │
+└──────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌──────────────────────────────────────────────────────────────┐
+│            CONCURRENT STEP 4: dub + subtitle                 │
+│  ┌──────────────┐        ┌──────────────┐                    │
+│  │ voiceover.mp4│        │  dub.mp4     │  (2 ffmpeg song song)│
+│  │ + subtitle   │        │ + subtitle   │                     │
+│  └──────────────┘        └──────────────┘                    │
+└──────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌──────────────────────────────────────────────────────────────┐
+│              STEP 5: upload (optional)                       │
+│  Google Drive — voiceover.mp4, dub.mp4, subtitle.srt         │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-| Step | Công nghệ | Output |
-|---|---|---|
-| **extract** | `youtube_transcript_api` (Python) | `transcript.json` |
-| **translate** | DeepSeek V4 Flash API (Go, 5 workers) | `translated.json` |
-| **tts** | Edge TTS free (Python, 2 modes) | `narrative.mp3` + `dub.mp3` |
-| **download** | yt-dlp (shell) | `{video_id}.mp4` |
-| **dub** | FFmpeg (voiceover + replace) | `voiceover.mp4` + `dub.mp4` |
+| Step | Công nghệ | Output | Concurrency |
+|---|---|---|---|
+| **extract** | `youtube_transcript_api` (Python) | `transcript.json` | ∥ download |
+| **download** | yt-dlp | `{video_id}.mp4` | ∥ extract |
+| **translate** | Google Translate / DeepSeek (5 workers) | `translated.json` | chunk song song |
+| **tts** | Edge TTS (Python, 10 workers) | `narrative.mp3` + `dub.mp3` | narrative ∥ dub |
+| **dub** | FFmpeg libopenh264 | `voiceover.mp4` + `dub.mp4` + `subtitle.srt` | voiceover ∥ replacement |
+| **upload** | Google Drive API | Shareable links | 3 files song song |
 
 ### 2 chế độ lồng tiếng
 
@@ -82,7 +138,16 @@ Tất cả config đều có thể override trực tiếp trên giao diện web 
 |---|---|---|
 | Audio gốc | Giữ 15% | Bỏ hoàn toàn |
 | TTS audio | Narrative (đọc liên tục) | Dubbing (sync timestamp) |
+| Phụ đề | Hardcode vào video | Hardcode vào video |
 | Output | `voiceover.mp4` | `dub.mp4` |
+
+### Audio alignment
+
+TTS audio thường dài hơn video gốc (tiếng Việt đọc chậm hơn). Vidub tự động:
+- **Tier 1:** FFmpeg `atempo` — tăng tốc tối đa +25% (giữ chất lượng)
+- **Tier 2:** FFmpeg `rubberband` — phase vocoder thêm +15% (giữ pitch)
+- **Fallback:** Trim + fade-out nếu vẫn quá dài
+- **amix duration=shortest** — ép output đúng video duration
 
 ### File-based checkpoint
 
@@ -93,10 +158,12 @@ data/{video_id}/
 ├── transcript.json       ← extract
 ├── translated.json       ← translate
 ├── narrative.mp3         ← TTS mode B
+├── narrative_aligned.mp3 ← align (nếu cần)
 ├── dub.mp3               ← TTS mode A
 ├── {video_id}.mp4        ← download
-├── voiceover.mp4         ← dub (voiceover)
-└── dub.mp4               ← dub (replace)
+├── subtitle.srt          ← generate từ translated
+├── voiceover.mp4         ← dub (voiceover) + subtitle
+└── dub.mp4               ← dub (replace) + subtitle
 ```
 
 ## Kiến trúc
@@ -104,17 +171,18 @@ data/{video_id}/
 ```
 Browser ──POST /jobs──▶ Go Server (Fiber, :8080)
   ▲ SSE stream           │
-  │ (htmx hx-ext="sse")  ├── scripts/extract.py
-  │                      ├── internal/translator/ (DeepSeek)
-  │                      ├── scripts/tts.py
-  │                      ├── yt-dlp
-  │                      └── internal/media/ (FFmpeg)
+  │ (htmx hx-ext="sse")  ├── scripts/extract.py      (extract)
+  │                      ├── internal/translator/      (translate)
+  │                      ├── scripts/tts.py           (TTS)
+  │                      ├── yt-dlp subprocess         (download)
+  │                      ├── internal/media/           (FFmpeg dub)
+  │                      └── internal/storage/         (Google Drive)
 ```
 
 - **Go Fiber** — HTTP server + HTML templates
-- **htmx + SSE** — frontend không cần JavaScript, progress real-time
-- **Python subprocess** — extract transcript + TTS (không có Go library tương đương)
-- **3 package reuse từ go-backend** — `translator/`, `tts/`, `media/` copy nguyên không sửa
+- **htmx + SSE** — Dashboard real-time, timeline log từng bước
+- **Python subprocess** — Extract transcript + TTS (không có Go library tương đương)
+- **File system** — State management, không cần database
 
 ### Cấu trúc thư mục
 
@@ -125,23 +193,25 @@ vidub/
 │   ├── config/config.go           # Load config từ env
 │   ├── sse/broker.go              # SSE pub/sub broker
 │   ├── pipeline/
-│   │   ├── pipeline.go            # Orchestrator, step dispatch
-│   │   ├── helpers.go             # SSE HTML builders, file helpers
+│   │   ├── pipeline.go            # Orchestrator, concurrency, timing
+│   │   ├── helpers.go             # SSE emit, step_log JSON, progress
 │   │   ├── step_extract.go        # Subprocess: extract.py
-│   │   ├── step_translate.go      # Go: DeepSeek translation
-│   │   ├── step_tts.go            # Subprocess: tts.py
+│   │   ├── step_translate.go      # Google/DeepSeek translation
+│   │   ├── step_tts.go            # Subprocess: tts.py (narrative ∥ dub)
 │   │   ├── step_download.go       # Subprocess: yt-dlp
-│   │   └── step_dub.go            # Go: FFmpeg mix via media.DubMixer
-│   ├── translator/                # Copy từ go-backend (DeepSeek, chunker, parser)
-│   ├── tts/                       # Copy từ go-backend (Edge TTS, audio utils)
-│   └── media/                     # Copy từ go-backend (DubMixer, voiceover/replace)
+│   │   └── step_dub.go            # FFmpeg mix (voiceover ∥ replacement)
+│   ├── translator/                # Google + DeepSeek providers, chunker, parser
+│   ├── tts/                       # Edge TTS client, audio alignment (atempo/rubberband)
+│   ├── media/                     # DubMixer (FFmpeg), subtitle SRT generator
+│   └── storage/                   # Google Drive client
 ├── scripts/
 │   ├── extract.py                 # youtube_transcript_api → JSON
 │   └── tts.py                     # edge-tts → narrative.mp3 + dub.mp3
 ├── templates/
-│   ├── base.html                  # Layout shell + CSS + htmx CDN
-│   ├── index.html                 # Job creation form
-│   └── job_progress.html          # SSE-powered progress page
+│   ├── partials/header.html       # Dashboard layout, sidebar, CSS, JS
+│   ├── partials/footer.html       # Close layout
+│   ├── index.html                 # Job form + pipeline view
+│   └── job_progress.html          # SSE timeline fragment
 ├── data/                          # Runtime artifacts
 ├── requirements.txt               # Python dependencies
 ├── go.mod
@@ -164,23 +234,22 @@ vidub/
 
 | Thành phần | Chi phí |
 |---|---|
-| DeepSeek V4 Flash | ~$0.001-0.005/video (487 từ) |
+| Google Translate | Miễn phí |
+| DeepSeek V4 Flash | ~$0.001-0.005/video |
 | DeepSeek V4 Pro | ~$0.003-0.01/video |
 | Edge TTS | Miễn phí |
 | yt-dlp + FFmpeg | Miễn phí |
+| Google Drive API | Miễn phí (15GB storage) |
 
-## So sánh với hệ thống Go backend
+## API
 
-| | vidub (đơn giản) | Go backend (đầy đủ) |
+| Endpoint | Method | Mô tả |
 |---|---|---|
-| GPU | Không | Cần (Demucs, WhisperX, CosyVoice) |
-| Database | Không (file system) | PostgreSQL |
-| Queue | Không | Asynq + Redis |
-| Audio separation | Không (voiceover 15%) | Demucs → BGM preservation |
-| Transcript | youtube_transcript_api | YouTube API + WhisperX fallback |
-| TTS | Edge TTS | Edge TTS + CosyVoice voice cloning |
-| Voice cloning | Không | Có |
-| Pause/confirm | Không | Có |
-| RAG glossary | Không | Có |
-| Frontend | htmx (server-rendered) | React + Ant Design |
-| Deploy | 1 binary + Python venv | Docker Compose (3 services) |
+| `/` | GET | Dashboard — form + timeline |
+| `/jobs` | POST | Tạo job mới (form submit) |
+| `/sse/jobs/:id` | GET | SSE stream — real-time log |
+| `/jobs/:id/files/:filename` | GET | Download artifact |
+
+## License
+
+MIT

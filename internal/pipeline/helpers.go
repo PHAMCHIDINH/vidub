@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -17,9 +18,14 @@ func ensureDir(path string) error {
 }
 
 func (p *Pipeline) emitStepLog(jobID, step, status, message string, elapsed float64) {
-	data := fmt.Sprintf(`{"step":"%s","status":"%s","time":"%s","message":"%s","elapsed":%.1f}`,
-		step, status, time.Now().Format("15:04:05"), message, elapsed)
-	p.broker.Publish(jobID, "step_log", data)
+	data, _ := json.Marshal(map[string]interface{}{
+		"step":    step,
+		"status":  status,
+		"time":    time.Now().Format("15:04:05"),
+		"message": message,
+		"elapsed": elapsed,
+	})
+	p.broker.Publish(jobID, "step_log", string(data))
 }
 
 func (p *Pipeline) emitStepStart(jobID, step string, allSteps []string) {
