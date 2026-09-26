@@ -16,3 +16,6 @@ Thumbs.db
 
 # Temp files
 .commandcode/
+
+# Python
+__pycache__/

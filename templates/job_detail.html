@@ -1,0 +1,13 @@
+{{template "partials/header" .}}
+
+<div id="pipeline-view">
+{{if .NotFound}}
+  {{template "partials/job_not_found" .}}
+{{else if eq .Job.Status "completed"}}
+  {{template "partials/job_results" .}}
+{{else}}
+  {{template "partials/pipeline_view" .}}
+{{end}}
+</div>
+
+{{template "partials/footer" .}}

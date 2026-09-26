@@ -101,8 +101,11 @@ def main():
                 "source": "youtube_api",
                 "transcript": segments,
             }
-            with open(output_path, "w", encoding="utf-8") as f:
+            # Write then rename, so an interrupted run leaves no partial file.
+            tmp_path = output_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(output, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, output_path)
             print(f"Transcript saved: {len(segments)} segments, language={lang}", file=sys.stderr)
             sys.exit(0)
 

@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
+	"strings"
 	"time"
 )
 
@@ -15,7 +15,6 @@ import (
 const (
 	deepseekBaseURL = "https://api.deepseek.com/v1"
 	deepseekModel   = "deepseek-v4-flash"
-	envDeepSeekKey  = "DEEPSEEK_API_KEY"
 )
 
 // DeepSeekProvider implements TranslationProvider using the DeepSeek API.
@@ -28,16 +27,11 @@ type DeepSeekProvider struct {
 }
 
 // NewDeepSeekProvider creates a new DeepSeekProvider.
-// The API key is read from the DEEPSEEK_API_KEY environment variable if not provided.
-func NewDeepSeekProvider(apiKey string) *DeepSeekProvider {
-	if apiKey == "" {
-		apiKey = os.Getenv(envDeepSeekKey)
-	}
-	model := os.Getenv("DEEPSEEK_MODEL")
+// An empty model means the default model.
+func NewDeepSeekProvider(apiKey, model string) *DeepSeekProvider {
 	if model == "" {
 		model = deepseekModel
 	}
-
 	return &DeepSeekProvider{
 		apiKey:  apiKey,
 		model:   model,
@@ -89,102 +83,29 @@ type deepSeekResponse struct {
 	Usage   deepSeekUsage    `json:"usage"`
 }
 
+// maxChunkAttempts is the number of API calls allowed per chunk. Calls after
+// the first only ask for the segments that are still missing.
+const maxChunkAttempts = 3
+
 // Translate implements TranslationProvider.Translate.
-// It sends each chunk to the DeepSeek API and returns the translated segments.
+// It returns exactly one TranslatedSegment per input segment, in input order.
 func (p *DeepSeekProvider) Translate(ctx context.Context, chunks []Chunk, glossary []GlossaryTerm, targetLang string) ([]TranslatedSegment, TokenUsage, error) {
 	if len(chunks) == 0 {
 		return nil, TokenUsage{}, nil
 	}
 
 	systemPrompt := BuildSystemPrompt(targetLang)
-	contextLines := DefaultContextLines
-
+	totalUsage := TokenUsage{Model: p.model}
 	var allSegments []TranslatedSegment
-	totalUsage := TokenUsage{
-		Model: p.model,
-	}
 
 	for _, chunk := range chunks {
-		if len(chunk.Segments) == 0 {
-			continue
-		}
-
-		userPrompt := BuildUserPrompt(chunk, glossary, contextLines)
-
-		// Build API request payload.
-		reqBody := deepSeekRequest{
-			Model: p.model,
-			Messages: []deepSeekMessage{
-				{Role: "system", Content: systemPrompt},
-				{Role: "user", Content: userPrompt},
-			},
-			MaxTokens:   8192,
-			Temperature: 0.3,
-		}
-
-		payloadBytes, err := json.Marshal(reqBody)
+		segs, usage, err := p.translateChunk(ctx, systemPrompt, chunk, glossary)
+		totalUsage.InputTokens += usage.InputTokens
+		totalUsage.OutputTokens += usage.OutputTokens
 		if err != nil {
-			return nil, totalUsage, fmt.Errorf("marshal request: %w", err)
+			return nil, totalUsage, err
 		}
-
-		// Create HTTP request.
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(payloadBytes))
-		if err != nil {
-			return nil, totalUsage, fmt.Errorf("create request: %w", err)
-		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
-
-		// Execute request.
-		resp, err := p.client.Do(httpReq)
-		if err != nil {
-			return nil, totalUsage, fmt.Errorf("API request failed: %w", err)
-		}
-		defer resp.Body.Close()
-
-		bodyBytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, totalUsage, fmt.Errorf("read response body: %w", err)
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, totalUsage, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(bodyBytes))
-		}
-
-		// Parse API response.
-		var apiResp deepSeekResponse
-		if err := json.Unmarshal(bodyBytes, &apiResp); err != nil {
-			return nil, totalUsage, fmt.Errorf("parse API response: %w", err)
-		}
-
-		if len(apiResp.Choices) == 0 {
-			return nil, totalUsage, fmt.Errorf("API returned no choices")
-		}
-
-		content := apiResp.Choices[0].Message.Content
-
-		// Parse the translated segments from the response content.
-		parsed, err := ParseTranslationResponse(content, len(chunk.Segments))
-		if err != nil {
-			return nil, totalUsage, fmt.Errorf("parse chunk response: %w", err)
-		}
-
-		// Map timestamps and speakers from input segments.
-		for i := range parsed {
-			if i < len(chunk.Segments) {
-				parsed[i].Start = chunk.Segments[i].Start
-				parsed[i].Duration = chunk.Segments[i].Duration
-				parsed[i].Speaker = chunk.Segments[i].Speaker
-				if parsed[i].OriginalText == "" {
-					parsed[i].OriginalText = chunk.Segments[i].Text
-				}
-			}
-		}
-
-		allSegments = append(allSegments, parsed...)
-
-		totalUsage.InputTokens += apiResp.Usage.PromptTokens
-		totalUsage.OutputTokens += apiResp.Usage.CompletionTokens
+		allSegments = append(allSegments, segs...)
 	}
 
 	// Calculate cost using DeepSeek pricing: $0.14/1M input, $0.28/1M output (estimate).
@@ -192,6 +113,134 @@ func (p *DeepSeekProvider) Translate(ctx context.Context, chunks []Chunk, glossa
 		(float64(totalUsage.OutputTokens)/1_000_000)*0.28
 
 	return allSegments, totalUsage, nil
+}
+
+// translateChunk returns one TranslatedSegment per input segment, carrying the
+// input timestamps. Translations are matched by id, so a merged or skipped
+// line can never shift text onto another segment's timestamp. Segments the
+// model skips are requested again, on their own, until maxChunkAttempts.
+func (p *DeepSeekProvider) translateChunk(ctx context.Context, systemPrompt string, chunk Chunk, glossary []GlossaryTerm) ([]TranslatedSegment, TokenUsage, error) {
+	var usage TokenUsage
+	texts := make([]string, len(chunk.Segments))
+
+	var pending []int // indexes into chunk.Segments still without a translation
+	for i, seg := range chunk.Segments {
+		if strings.TrimSpace(seg.Text) != "" {
+			pending = append(pending, i)
+		}
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < maxChunkAttempts && len(pending) > 0; attempt++ {
+		if attempt > 0 {
+			select { // back off a little, mostly for rate limits
+			case <-ctx.Done():
+				return nil, usage, ctx.Err()
+			case <-time.After(time.Duration(attempt) * time.Second):
+			}
+		}
+
+		sub := Chunk{Context: chunk.Context, Segments: make([]Segment, len(pending))}
+		for k, idx := range pending {
+			sub.Segments[k] = chunk.Segments[idx]
+		}
+
+		content, u, err := p.complete(ctx, systemPrompt, BuildUserPrompt(sub, glossary, DefaultContextLines))
+		usage.InputTokens += u.InputTokens
+		usage.OutputTokens += u.OutputTokens
+		if err != nil {
+			if IsPermanent(err) {
+				return nil, usage, err // a bad key stays bad; do not retry
+			}
+			lastErr = err
+			continue
+		}
+
+		got, err := ParseTranslations(content, len(sub.Segments))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		var missing []int
+		for k, idx := range pending {
+			if text, ok := got[k]; ok {
+				texts[idx] = text
+			} else {
+				missing = append(missing, idx)
+			}
+		}
+		if len(missing) > 0 {
+			lastErr = fmt.Errorf("model skipped %d of %d segments", len(missing), len(pending))
+		}
+		pending = missing
+	}
+
+	if len(pending) > 0 {
+		return nil, usage, fmt.Errorf("%d of %d segments untranslated after %d attempts: %w",
+			len(pending), len(chunk.Segments), maxChunkAttempts, lastErr)
+	}
+
+	out := make([]TranslatedSegment, len(chunk.Segments))
+	for i, seg := range chunk.Segments {
+		out[i] = TranslatedSegment{
+			Text:         texts[i],
+			OriginalText: seg.Text,
+			Start:        seg.Start,
+			Duration:     seg.Duration,
+			Speaker:      seg.Speaker,
+		}
+	}
+	return out, usage, nil
+}
+
+// complete sends one chat completion request and returns the message content.
+func (p *DeepSeekProvider) complete(ctx context.Context, systemPrompt, userPrompt string) (string, TokenUsage, error) {
+	reqBody := deepSeekRequest{
+		Model: p.model,
+		Messages: []deepSeekMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
+		},
+		MaxTokens:   8192,
+		Temperature: 0.3,
+	}
+
+	payloadBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", TokenUsage{}, fmt.Errorf("marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(payloadBytes))
+	if err != nil {
+		return "", TokenUsage{}, fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+
+	resp, err := p.client.Do(httpReq)
+	if err != nil {
+		return "", TokenUsage{}, fmt.Errorf("API request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", TokenUsage{}, fmt.Errorf("read response body: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", TokenUsage{}, &APIError{Provider: "deepseek", Status: resp.StatusCode, Body: truncateStr(string(bodyBytes), 300)}
+	}
+
+	var apiResp deepSeekResponse
+	if err := json.Unmarshal(bodyBytes, &apiResp); err != nil {
+		return "", TokenUsage{}, fmt.Errorf("parse API response: %w", err)
+	}
+	usage := TokenUsage{InputTokens: apiResp.Usage.PromptTokens, OutputTokens: apiResp.Usage.CompletionTokens}
+	if len(apiResp.Choices) == 0 {
+		return "", usage, fmt.Errorf("API returned no choices")
+	}
+	return apiResp.Choices[0].Message.Content, usage, nil
 }
 
 // ensure interfaces match at compile time

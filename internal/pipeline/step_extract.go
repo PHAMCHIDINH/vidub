@@ -11,9 +11,13 @@ import (
 
 func (p *Pipeline) stepExtract(ctx context.Context, job *VideoJob) error {
 	outputPath := filepath.Join(job.WorkDir, "transcript.json")
-	if fileExists(outputPath) {
+	if fileExists(outputPath) && !job.ForceRefresh["extract"] {
 		log.Printf("[%s] extract skipped (transcript.json exists)", job.VideoID)
-		return nil // already done
+		return nil
+	}
+	if job.ForceRefresh["extract"] && fileExists(outputPath) {
+		log.Printf("[%s] extract: force refresh, deleting cached transcript.json", job.VideoID)
+		os.Remove(outputPath)
 	}
 
 	log.Printf("[%s] extracting transcript from YouTube...", job.VideoID)

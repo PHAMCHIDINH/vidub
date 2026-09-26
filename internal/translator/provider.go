@@ -8,6 +8,9 @@ type Segment struct {
 	Start    float64 `json:"start"`
 	Duration float64 `json:"duration"`
 	Speaker  string  `json:"speaker,omitempty"`
+	// MaxChars is the longest translation that can be spoken in time
+	// (see SetCharBudgets). Zero means no limit.
+	MaxChars int `json:"max_chars,omitempty"`
 }
 
 // TranslatedSegment represents a translated transcript segment.
@@ -37,30 +40,6 @@ type TokenUsage struct {
 	OutputTokens int     `json:"output"`
 	CostUSD      float64 `json:"cost_usd"`
 	Model        string  `json:"model"`
-}
-
-// Transcript represents the full extracted transcript JSON file.
-type Transcript struct {
-	VideoID     string    `json:"video_id"`
-	Language    string    `json:"language"`
-	Source      string    `json:"source,omitempty"`
-	Segments    []Segment `json:"segments"`
-}
-
-// TranslationResult is the top-level output structure written to disk.
-type TranslationResult struct {
-	VideoID        string              `json:"video_id"`
-	SourceLanguage string              `json:"source_language"`
-	TargetLanguage string              `json:"target_language"`
-	Provider       string              `json:"provider"`
-	Model          string              `json:"model"`
-	TokenUsage     TokenUsage          `json:"token_usage"`
-	ContextWindow  int                 `json:"context_window"`
-	RAGTermsUsed   int                 `json:"rag_terms_used"`
-	FailedChunks   int                 `json:"failed_chunks"`
-	TotalChunks    int                 `json:"total_chunks"`
-	Segments       []TranslatedSegment `json:"segments"`
-	TranslatedAt   string              `json:"translated_at"`
 }
 
 // TranslationProvider is the interface for translation backends.

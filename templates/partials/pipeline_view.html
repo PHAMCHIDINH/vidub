@@ -1,0 +1,17 @@
+{{/* Content of #pipeline-view for a running or failed job.
+     Pipeline events arrive over SSE and are swapped in by sse-swap.
+     The server replays past events on connect, so a late or reloaded page
+     still shows the full timeline. */}}
+<h2 style="margin-bottom:1rem">Job <span style="color:#58a6ff;font-family:monospace">{{.VideoID}}</span></h2>
+{{if .Job.Mode}}<p class="muted" style="margin-bottom:1rem">Mode: {{.Job.Mode}}{{with .Job.Voice}} | Voice: {{.}}{{end}}</p>{{end}}
+<div hx-ext="sse" sse-connect="/sse/jobs/{{.VideoID}}">
+  <div class="card" id="progress-box" sse-swap="progress">
+    <div class="pipeline-header"><span class="muted" id="pct-label">0%</span></div>
+    <progress value="0" max="100" id="job-progress"></progress>
+  </div>
+  <div class="card" id="timeline" sse-swap="step_log" hx-swap="beforeend">
+    <p class="muted tl-placeholder">{{if eq .Job.Status "failed"}}No timeline recorded for this run.{{else}}Waiting for pipeline events...{{end}}</p>
+  </div>
+  {{/* A replayed job_error replaces the static notice below, so it never shows twice. */}}
+  <div id="results" sse-swap="job_complete,job_error">{{if eq .Job.Status "failed"}}<div class="card" style="border-color:#da3633"><p>❌ This job failed or was interrupted by a server restart. Start it again from the home page.</p></div>{{end}}</div>
+</div>

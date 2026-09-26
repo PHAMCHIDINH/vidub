@@ -7,18 +7,21 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
 )
 
+// stepTTS builds the speech track of the job's Mix Mode:
+// narrative.mp3 (continuous reading) for voiceover, dub.mp3 (each line at
+// its timestamp) for replace.
 func (p *Pipeline) stepTTS(ctx context.Context, job *VideoJob) error {
-	narrativePath := filepath.Join(job.WorkDir, "narrative.mp3")
-	dubPath := filepath.Join(job.WorkDir, "dub.mp3")
+	translatedPath := filepath.Join(job.WorkDir, "translated.json")
+	scriptMode, outPath := "narrative", filepath.Join(job.WorkDir, "narrative.mp3")
+	if job.Mode == ModeReplace {
+		scriptMode, outPath = "dub", filepath.Join(job.WorkDir, "dub.mp3")
+	}
+	name := filepath.Base(outPath)
 
-	hasNarrative := fileExists(narrativePath)
-	hasDub := fileExists(dubPath)
-
-	if hasNarrative && hasDub {
-		log.Printf("[%s] tts skipped (both narrative and dub exist)", job.VideoID)
+	if !job.ForceRefresh["tts"] && fresh(outPath, translatedPath) {
+		log.Printf("[%s] tts skipped (%s is up to date)", job.VideoID, name)
 		return nil
 	}
 
@@ -27,50 +30,15 @@ func (p *Pipeline) stepTTS(ctx context.Context, job *VideoJob) error {
 		voice = p.cfg.TTSVoice
 	}
 
+	log.Printf("[%s] tts: generating %s...", job.VideoID, name)
 	script := filepath.Join("scripts", "tts.py")
-
-	// Run narrative and dub TTS concurrently (Edge-TTS network calls, independent).
-	var wg sync.WaitGroup
-	var narrativeErr, dubErr error
-	wg.Add(2)
-
-	if !hasNarrative {
-		go func() {
-			defer wg.Done()
-			log.Printf("[%s] tts: generating narrative...", job.VideoID)
-			cmd := exec.CommandContext(ctx, "python3", script, job.VideoID, job.WorkDir, voice, "--mode", "narrative")
-			cmd.Stderr = os.Stderr
-			if err := cmd.Run(); err != nil {
-				narrativeErr = fmt.Errorf("narrative tts failed: %w", err)
-			}
-		}()
-	} else {
-		wg.Done()
+	cmd := exec.CommandContext(ctx, "python3", script, job.VideoID, job.WorkDir, voice, "--mode", scriptMode)
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s tts failed: %w", scriptMode, err)
 	}
-
-	if !hasDub {
-		go func() {
-			defer wg.Done()
-			log.Printf("[%s] tts: generating dubbing...", job.VideoID)
-			cmd := exec.CommandContext(ctx, "python3", script, job.VideoID, job.WorkDir, voice, "--mode", "dub")
-			cmd.Stderr = os.Stderr
-			if err := cmd.Run(); err != nil {
-				dubErr = fmt.Errorf("dub tts failed: %w", err)
-			}
-		}()
-	} else {
-		wg.Done()
+	if !fileExists(outPath) {
+		return fmt.Errorf("%s tts finished but %s was not written", scriptMode, name)
 	}
-
-	wg.Wait()
-
-	if narrativeErr != nil {
-		return narrativeErr
-	}
-	if dubErr != nil {
-		return dubErr
-	}
-
-	log.Printf("[%s] tts: both completed", job.VideoID)
 	return nil
 }
