@@ -42,7 +42,9 @@ MAX_UNIT_SECONDS = 15.0   # bounds how far speech can drift from its caption
 UNIT_GAP_SECONDS = 0.6    # a pause at least this long always ends a unit
 SENTENCE_END = (".", "?", "!", "…", "。", "？", "！")
 TTS_PITCH = "+0Hz"
-TTS_RETRIES = 3
+# Edge TTS intermittently answers "No audio was received" for valid input,
+# more often under parallel load. Waits between tries: 2, 4, 8, 16 seconds.
+TTS_RETRIES = 5
 
 
 # ─── Helpers ───────────────────────────────────────────────────

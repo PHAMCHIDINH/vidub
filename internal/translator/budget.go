@@ -4,7 +4,8 @@ import "sort"
 
 // BudgetCharsPerSecond is how many characters of Vietnamese speech fit in
 // one second of video: about 15 chars/s at normal Edge TTS speed, plus the
-// 10% speed-up that still sounds natural. scripts/tts.py prints the measured
+// 10% speed-up that still sounds natural. Measured on real captions:
+// HoaiMy 16.0 and NamMinh 15.7 chars/s, so this errs slightly short. scripts/tts.py prints the measured
 // rate after each dub ("Measured speech rate"), use it to tune this value.
 const BudgetCharsPerSecond = 16.5
 

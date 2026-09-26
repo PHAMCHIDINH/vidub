@@ -222,15 +222,12 @@ vidub/
 
 ## Giọng đọc
 
-5 giọng neural tiếng Việt từ Microsoft Edge TTS (miễn phí):
+2 giọng neural tiếng Việt từ Microsoft Edge TTS (miễn phí). Đây là toàn bộ giọng tiếng Việt mà `edge-tts --list-voices` liệt kê:
 
-| Voice ID | Giới tính | Vùng miền |
+| Voice ID | Giới tính | Tốc độ đọc đo được |
 |---|---|---|
-| `vi-VN-HoaiMyNeural` | Nữ | Miền Nam |
-| `vi-VN-NamMinhNeural` | Nam | Miền Nam |
-| `vi-VN-HongAnNeural` | Nữ | Miền Bắc |
-| `vi-VN-AnhDungNeural` | Nam | Miền Bắc |
-| `vi-VN-LinhSanNeural` | Nữ | Miền Trung |
+| `vi-VN-HoaiMyNeural` | Nữ | khoảng 16 ký tự/giây |
+| `vi-VN-NamMinhNeural` | Nam | |
 
 ## Chi phí
 

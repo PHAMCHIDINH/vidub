@@ -31,12 +31,10 @@ type voiceOption struct {
 	Label string
 }
 
+// voices are the Vietnamese voices Edge TTS offers ("edge-tts --list-voices").
 var voices = []voiceOption{
-	{"vi-VN-HoaiMyNeural", "Hoai My — Female, Southern"},
-	{"vi-VN-NamMinhNeural", "Nam Minh — Male, Southern"},
-	{"vi-VN-HongAnNeural", "Hong An — Female, Northern"},
-	{"vi-VN-AnhDungNeural", "Anh Dung — Male, Northern"},
-	{"vi-VN-LinhSanNeural", "Linh San — Female, Central"},
+	{"vi-VN-HoaiMyNeural", "Hoai My — Female"},
+	{"vi-VN-NamMinhNeural", "Nam Minh — Male"},
 }
 
 func main() {
