@@ -1,0 +1,15 @@
+{{/* Content of #pipeline-view for a completed job. */}}
+<h2 style="margin-bottom:1rem">Job <span style="color:#58a6ff;font-family:monospace">{{.VideoID}}</span></h2>
+<p class="muted" style="margin-bottom:1rem">
+  {{with .Job.Mode}}Mode: {{.}} | {{end}}{{with .Job.Voice}}Voice: {{.}} | {{end}}Status: <span class="badge done"></span> completed
+</p>
+<div class="card">
+  <div class="pipeline-header"><span class="muted" id="pct-label">100% — Done!</span></div>
+  <progress value="100" max="100" id="job-progress"></progress>
+</div>
+<div class="card">
+  <div class="downloads">
+    {{range .Files}}<a href="/jobs/{{$.VideoID}}/files/{{.Name}}" class="download-btn">⬇ {{.Label}}</a>
+    {{else}}<p class="muted">No output files found. They may have been cleaned up.</p>{{end}}
+  </div>
+</div>

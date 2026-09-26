@@ -2,15 +2,25 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"vidub/internal/config"
 	"vidub/internal/sse"
 	"vidub/internal/storage"
+	"vidub/internal/store"
+)
+
+// Mix Modes. A job only builds the audio and video of its mode.
+const (
+	ModeVoiceover = "voiceover" // narrative.mp3 over the original audio: voiceover.mp4
+	ModeReplace   = "replace"   // timestamped dub.mp3 instead of it: dub.mp4
 )
 
 type VideoJob struct {
@@ -20,167 +30,144 @@ type VideoJob struct {
 	Voice   string
 	APIKey  string
 	WorkDir string
+	// ForceRefresh maps a step name to true when its cached output must be recomputed.
+	ForceRefresh map[string]bool
 }
 
 type JobResult struct {
 	VideoID      string
 	VoiceoverMP4 string
 	DubMP4       string
-	VoiceoverGDrive string
-	DubGDrive       string
-	SubtitleGDrive  string
-	DriveUploaded   bool
 }
 
 type Pipeline struct {
 	cfg    *config.Config
 	broker *sse.Broker
-	gdrive *storage.DriveClient
+	jobs   *store.JobStore
 }
+
+type stepFunc func(context.Context, *VideoJob) error
 
 type stepEntry struct {
 	name string
-	fn   func(context.Context, *VideoJob) error
+	fn   stepFunc
 }
 
-func New(cfg *config.Config, broker *sse.Broker, gdrive *storage.DriveClient) *Pipeline {
-	return &Pipeline{cfg: cfg, broker: broker, gdrive: gdrive}
+// totalSteps is used for the progress percentage.
+const totalSteps = 5
+
+func New(cfg *config.Config, broker *sse.Broker, jobs *store.JobStore) *Pipeline {
+	return &Pipeline{cfg: cfg, broker: broker, jobs: jobs}
 }
 
+// Run executes the whole pipeline and records the final JobStatus in the store.
 func (p *Pipeline) Run(ctx context.Context, job VideoJob) (*JobResult, error) {
 	log.Printf("[%s] 🚀 pipeline started | mode=%s | voice=%s", job.VideoID, job.Mode, job.Voice)
 
-	if err := ensureDir(job.WorkDir); err != nil {
-		p.emitError(job.VideoID, "job_error", fmt.Sprintf("Cannot create work dir: %v", err))
+	if err := p.run(ctx, &job); err != nil {
+		// Status first, so a page reload after the event renders the final state.
+		p.finish(&job, store.JobFailed)
+		p.emitError(job.VideoID, err.Error())
 		return nil, err
 	}
 
-	// Step 1: Run extract and download concurrently (both network I/O, independent).
-	p.emitStepLog(job.VideoID, "extract", "started", "extract + download starting...", 0)
-	p.emitStepLog(job.VideoID, "download", "started", "download starting...", 0)
+	p.finish(&job, store.JobCompleted)
+	p.emitComplete(job.VideoID, job.WorkDir)
+	log.Printf("[%s] ✅ pipeline finished successfully", job.VideoID)
 
-	ioStart := time.Now()
-	var wgIO sync.WaitGroup
-	var extractErr, downloadErr error
-	wgIO.Add(2)
-
-	go func() {
-		defer wgIO.Done()
-		extractErr = p.stepExtract(ctx, &job)
-	}()
-	go func() {
-		defer wgIO.Done()
-		downloadErr = p.stepDownload(ctx, &job)
-	}()
-
-	wgIO.Wait()
-	ioElapsed := time.Since(ioStart).Seconds()
-
-	if extractErr != nil {
-		log.Printf("[%s] ✗ extract FAILED (%.1fs): %v", job.VideoID, ioElapsed, extractErr)
-		p.emitStepLog(job.VideoID, "extract", "failed", extractErr.Error(), ioElapsed)
-		return nil, fmt.Errorf("step extract: %w", extractErr)
-	}
-	p.emitStepLog(job.VideoID, "extract", "completed", fmt.Sprintf("Done in %.1fs", ioElapsed), ioElapsed)
-	p.emitProgress(job.VideoID, "extract", 20, nil)
-
-	if downloadErr != nil {
-		log.Printf("[%s] ✗ download FAILED (%.1fs): %v", job.VideoID, ioElapsed, downloadErr)
-		p.emitStepLog(job.VideoID, "download", "failed", downloadErr.Error(), ioElapsed)
-		return nil, fmt.Errorf("step download: %w", downloadErr)
-	}
-	p.emitStepLog(job.VideoID, "download", "completed", fmt.Sprintf("Done in %.1fs", ioElapsed), ioElapsed)
-	p.emitProgress(job.VideoID, "download", 40, nil)
-
-	// Steps 2-4: translate → tts → dub (sequential, each depends on previous).
-	remainingSteps := []stepEntry{
-		{"translate", p.stepTranslate},
-		{"tts", p.stepTTS},
-		{"dub", p.stepDub},
-	}
-
-	for i, s := range remainingSteps {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		stepNum := fmt.Sprintf("%d/%d", i+3, len(remainingSteps)+2)
-		log.Printf("[%s] [%s] ▶ %s starting...", job.VideoID, stepNum, s.name)
-		p.emitStepLog(job.VideoID, s.name, "started", s.name+" starting...", 0)
-
-		startTime := time.Now()
-		if err := s.fn(ctx, &job); err != nil {
-			elapsed := time.Since(startTime).Seconds()
-			log.Printf("[%s] [%s] ✗ %s FAILED (%.1fs): %v", job.VideoID, stepNum, s.name, elapsed, err)
-			p.emitStepLog(job.VideoID, s.name, "failed", err.Error(), elapsed)
-			p.emitError(job.VideoID, "job_error", fmt.Sprintf("Step %s failed: %v", s.name, err))
-			return nil, fmt.Errorf("step %s: %w", s.name, err)
-		}
-
-		elapsed := time.Since(startTime).Seconds()
-		log.Printf("[%s] [%s] ✓ %s completed (%.1fs)", job.VideoID, stepNum, s.name, elapsed)
-		p.emitStepLog(job.VideoID, s.name, "completed", fmt.Sprintf("Done in %.1fs", elapsed), elapsed)
-
-		pct := float64(i+3) / float64(len(remainingSteps)+2) * 100
-		p.emitProgress(job.VideoID, s.name, pct, nil)
-	}
-
-	result := &JobResult{
+	return &JobResult{
 		VideoID:      job.VideoID,
 		VoiceoverMP4: filepath.Join(job.WorkDir, "voiceover.mp4"),
 		DubMP4:       filepath.Join(job.WorkDir, "dub.mp4"),
+	}, nil
+}
+
+// finish records the final status in the store and in job.json.
+func (p *Pipeline) finish(job *VideoJob, status store.JobStatus) {
+	if stored, ok := p.jobs.SetStatus(job.VideoID, status); ok {
+		p.saveMeta(job.WorkDir, stored)
+	}
+}
+
+func (p *Pipeline) saveMeta(dir string, stored store.StoredJob) {
+	if err := storage.SaveJobMeta(dir, stored); err != nil {
+		log.Printf("[%s] cannot save job.json: %v", stored.VideoID, err)
+	}
+}
+
+func (p *Pipeline) run(ctx context.Context, job *VideoJob) error {
+	if err := ensureDir(job.WorkDir); err != nil {
+		return fmt.Errorf("cannot create work dir: %w", err)
+	}
+	// Cleanup ages jobs by directory mtime. A re-run served entirely from
+	// cache writes nothing new, so refresh it to count from this run.
+	now := time.Now()
+	if err := os.Chtimes(job.WorkDir, now, now); err != nil {
+		log.Printf("[%s] cannot refresh work dir time: %v", job.VideoID, err)
+	}
+	if stored, ok := p.jobs.Get(job.VideoID); ok {
+		p.saveMeta(job.WorkDir, stored)
 	}
 
-	// Upload to Google Drive if enabled.
-	if p.gdrive != nil {
-		p.emitStepLog(job.VideoID, "upload", "started", "uploading to Google Drive...", 0)
-		uploadStart := time.Now()
-
-		var wg sync.WaitGroup
-		wg.Add(3)
-
-		go func() {
-			defer wg.Done()
-			link, err := p.gdrive.UploadFile(result.VoiceoverMP4, job.VideoID, "video/mp4")
-			if err != nil {
-				log.Printf("[%s] gdrive voiceover upload failed: %v", job.VideoID, err)
-				return
-			}
-			result.VoiceoverGDrive = link
-			result.DriveUploaded = true
-		}()
-
-		go func() {
-			defer wg.Done()
-			link, err := p.gdrive.UploadFile(result.DubMP4, job.VideoID, "video/mp4")
-			if err != nil {
-				log.Printf("[%s] gdrive dub upload failed: %v", job.VideoID, err)
-				return
-			}
-			result.DubGDrive = link
-			result.DriveUploaded = true
-		}()
-
-		go func() {
-			defer wg.Done()
-			subtitlePath := filepath.Join(job.WorkDir, "subtitle.srt")
-			link, err := p.gdrive.UploadFile(subtitlePath, job.VideoID, "text/plain")
-			if err != nil {
-				log.Printf("[%s] gdrive subtitle upload failed: %v", job.VideoID, err)
-				return
-			}
-			result.SubtitleGDrive = link
-			result.DriveUploaded = true
-		}()
-
-		wg.Wait()
-		uploadElapsed := time.Since(uploadStart).Seconds()
-		p.emitStepLog(job.VideoID, "upload", "completed", fmt.Sprintf("Uploaded in %.1fs", uploadElapsed), uploadElapsed)
+	var completed atomic.Int32
+	step := func(name string, fn stepFunc) error {
+		if err := p.runStep(ctx, job, name, fn); err != nil {
+			return err
+		}
+		pct := float64(completed.Add(1)) / totalSteps * 100
+		p.emitProgress(job.VideoID, pct)
+		return nil
 	}
 
-	p.emitComplete(job.VideoID, result)
-	log.Printf("[%s] ✅ pipeline finished successfully", job.VideoID)
-	return result, nil
+	// extract and download are independent network I/O, so run them together.
+	var wg sync.WaitGroup
+	var extractErr, downloadErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		extractErr = step("extract", p.stepExtract)
+	}()
+	go func() {
+		defer wg.Done()
+		downloadErr = step("download", p.stepDownload)
+	}()
+	wg.Wait()
+	if err := errors.Join(extractErr, downloadErr); err != nil {
+		return err
+	}
+
+	// The rest is sequential: each step reads the previous step's output.
+	for _, s := range []stepEntry{
+		{"translate", p.stepTranslate},
+		{"tts", p.stepTTS},
+		{"dub", p.stepDub},
+	} {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := step(s.name, s.fn); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// runStep runs one step and reports it to the log and the timeline.
+func (p *Pipeline) runStep(ctx context.Context, job *VideoJob, name string, fn stepFunc) error {
+	log.Printf("[%s] ▶ %s starting...", job.VideoID, name)
+	p.emitStepLog(job.VideoID, name, "started", name+" starting...", 0)
+
+	start := time.Now()
+	err := fn(ctx, job)
+	elapsed := time.Since(start).Seconds()
+
+	if err != nil {
+		log.Printf("[%s] ✗ %s FAILED (%.1fs): %v", job.VideoID, name, elapsed, err)
+		p.emitStepLog(job.VideoID, name, "failed", err.Error(), elapsed)
+		return fmt.Errorf("step %s: %w", name, err)
+	}
+
+	log.Printf("[%s] ✓ %s completed (%.1fs)", job.VideoID, name, elapsed)
+	p.emitStepLog(job.VideoID, name, "completed", fmt.Sprintf("Done in %.1fs", elapsed), elapsed)
+	return nil
 }

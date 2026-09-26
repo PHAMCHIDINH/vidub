@@ -3,6 +3,7 @@ package translator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -46,39 +47,11 @@ func (p *GoogleProvider) Translate(ctx context.Context, chunks []Chunk, glossary
 			continue
 		}
 
-		// Build joined text with separator.
-		var parts []string
-		for _, seg := range chunk.Segments {
-			parts = append(parts, seg.Text)
-		}
-		joined := strings.Join(parts, " ||| ")
-
-		// Call Google Translate API.
-		translated, err := p.translateText(ctx, joined)
+		segs, err := p.translateChunk(ctx, chunk)
 		if err != nil {
 			return nil, TokenUsage{}, fmt.Errorf("google translate: %w", err)
 		}
-
-		// Split result back into segments.
-		transParts := strings.Split(translated, "|||")
-		for i := range transParts {
-			transParts[i] = strings.TrimSpace(transParts[i])
-		}
-
-		for i := range chunk.Segments {
-			seg := TranslatedSegment{
-				OriginalText: chunk.Segments[i].Text,
-				Start:        chunk.Segments[i].Start,
-				Duration:     chunk.Segments[i].Duration,
-				Speaker:      chunk.Segments[i].Speaker,
-			}
-			if i < len(transParts) {
-				seg.Text = transParts[i]
-			} else {
-				seg.Text = chunk.Segments[i].Text // fallback to original
-			}
-			allSegments = append(allSegments, seg)
-		}
+		allSegments = append(allSegments, segs...)
 
 		// Rate limit: be polite to Google's free API.
 		select {
@@ -91,7 +64,78 @@ func (p *GoogleProvider) Translate(ctx context.Context, chunks []Chunk, glossary
 	return allSegments, TokenUsage{Model: "google-translate"}, nil
 }
 
+// googleSeparator joins a chunk into one request. Google usually keeps it,
+// but sometimes drops or rewrites one, so the count is always checked.
+const googleSeparator = "|||"
+
+// translateChunk returns one TranslatedSegment per input segment.
+func (p *GoogleProvider) translateChunk(ctx context.Context, chunk Chunk) ([]TranslatedSegment, error) {
+	parts := make([]string, len(chunk.Segments))
+	for i, seg := range chunk.Segments {
+		parts[i] = seg.Text
+	}
+
+	joined, err := p.translateText(ctx, strings.Join(parts, " "+googleSeparator+" "))
+	if err != nil {
+		return nil, err
+	}
+
+	texts := strings.Split(joined, googleSeparator)
+	if len(texts) != len(parts) {
+		// A separator got lost. Mapping by position would shift every later
+		// line onto the wrong timestamp, so translate each segment on its own.
+		texts = make([]string, len(parts))
+		for i, part := range parts {
+			if strings.TrimSpace(part) == "" {
+				continue
+			}
+			if texts[i], err = p.translateText(ctx, part); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	out := make([]TranslatedSegment, len(chunk.Segments))
+	for i, seg := range chunk.Segments {
+		out[i] = TranslatedSegment{
+			Text:         strings.TrimSpace(texts[i]),
+			OriginalText: seg.Text,
+			Start:        seg.Start,
+			Duration:     seg.Duration,
+			Speaker:      seg.Speaker,
+		}
+	}
+	return out, nil
+}
+
+// googleAttempts is the number of tries per request. The free endpoint
+// rate-limits and fails transiently under parallel load.
+const googleAttempts = 3
+
+// translateText translates one piece of text, retrying transient failures.
 func (p *GoogleProvider) translateText(ctx context.Context, text string) (string, error) {
+	var err error
+	for attempt := 0; attempt < googleAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(time.Duration(attempt) * time.Second):
+			}
+		}
+		var out string
+		if out, err = p.translateOnce(ctx, text); err == nil {
+			return out, nil
+		}
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && !apiErr.Retryable() {
+			break // e.g. 400: the same request will fail again
+		}
+	}
+	return "", err
+}
+
+func (p *GoogleProvider) translateOnce(ctx context.Context, text string) (string, error) {
 	params := url.Values{}
 	params.Set("client", "gtx")
 	params.Set("sl", "auto")
@@ -115,7 +159,7 @@ func (p *GoogleProvider) translateText(ctx context.Context, text string) (string
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncateStr(string(body), 200))
+		return "", &APIError{Provider: "google", Status: resp.StatusCode, Body: truncateStr(string(body), 200)}
 	}
 
 	body, err := io.ReadAll(resp.Body)

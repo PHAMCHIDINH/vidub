@@ -10,55 +10,75 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // DubMixer mixes video and audio streams using FFmpeg for the dubbing pipeline.
 type DubMixer struct {
 	ffmpegPath  string
 	ffprobePath string
-	// VideoEncoder is the video codec used for encoding output files.
-	// Default "libopenh264" (H.264). Override for testing or custom codec needs.
+	// VideoEncoder is the H.264 encoder used when the video must be re-encoded
+	// (to burn in subtitles). Empty means auto: libx264 when this FFmpeg has
+	// it, otherwise libopenh264 (Fedora's FFmpeg ships without libx264).
 	VideoEncoder string
 }
 
-// NewDubMixer creates a DubMixer with default settings (libopenh264 video encoder).
-// Empty paths default to "ffmpeg" and "ffprobe" found on PATH.
+// NewDubMixer creates a DubMixer that uses ffmpeg and ffprobe from PATH.
 func NewDubMixer() *DubMixer {
 	return &DubMixer{
-		ffmpegPath:   "ffmpeg",
-		ffprobePath:  "ffprobe",
-		VideoEncoder: "libopenh264",
+		ffmpegPath:  "ffmpeg",
+		ffprobePath: "ffprobe",
 	}
 }
 
-// MixVoiceover creates a voiceover-style video by mixing original audio (15%),
-// narrative TTS (100%), and optional BGM (80%).
-//
-// Parameters:
-//   - videoPath: path to the original video file
-//   - narrativePath: path to the narrative TTS audio (required)
-//   - bgmPath: path to background music (optional; pass "" to skip)
-//   - outputPath: path for the output MP4 file
-func (m *DubMixer) MixVoiceover(ctx context.Context, videoPath, narrativePath, bgmPath, outputPath string) error {
-	return m.mix(ctx, videoPath, narrativePath, bgmPath, "", outputPath, "voiceover")
+var (
+	detectOnce      sync.Once
+	detectedEncoder string
+)
+
+// videoEncoder returns the configured encoder, or detects one once per process.
+func (m *DubMixer) videoEncoder() string {
+	if m.VideoEncoder != "" {
+		return m.VideoEncoder
+	}
+	detectOnce.Do(func() {
+		detectedEncoder = "libopenh264"
+		out, err := exec.Command(m.ffmpegPath, "-hide_banner", "-encoders").Output()
+		if err == nil && strings.Contains(string(out), " libx264 ") {
+			detectedEncoder = "libx264"
+		}
+	})
+	return detectedEncoder
 }
 
+// videoCodecArgs returns the video codec options. Each encoder takes its own
+// quality settings: libopenh264 ignores -crf and -preset, so without an
+// explicit bitrate it falls back to its low default.
+func videoCodecArgs(encoder string, reencode bool) []string {
+	if !reencode {
+		return []string{"-c:v", "copy"} // nothing to draw on the picture
+	}
+	switch encoder {
+	case "libx264":
+		return []string{"-c:v", "libx264", "-crf", "23", "-preset", "medium", "-pix_fmt", "yuv420p"}
+	case "libopenh264":
+		// Downloads are capped at 720p (see stepDownload); 2.5 Mb/s suits that.
+		return []string{"-c:v", "libopenh264", "-b:v", "2500k", "-pix_fmt", "yuv420p"}
+	default:
+		return []string{"-c:v", encoder}
+	}
+}
+
+// MixVoiceoverWithSubs creates a voiceover-style video by mixing original
+// audio (15%), narrative TTS (100%) and optional BGM (80%), with optional
+// burned-in subtitles.
 func (m *DubMixer) MixVoiceoverWithSubs(ctx context.Context, videoPath, narrativePath, bgmPath, subsPath, outputPath string) error {
 	return m.mix(ctx, videoPath, narrativePath, bgmPath, subsPath, outputPath, "voiceover")
 }
 
-// MixReplacement creates a replacement-style video by mixing dubbing TTS (100%)
-// and optional BGM (80%), with no original audio.
-//
-// Parameters:
-//   - videoPath: path to the original video file
-//   - dubPath: path to the dubbing TTS audio (required)
-//   - bgmPath: path to background music (optional; pass "" to skip)
-//   - outputPath: path for the output MP4 file
-func (m *DubMixer) MixReplacement(ctx context.Context, videoPath, dubPath, bgmPath, outputPath string) error {
-	return m.mix(ctx, videoPath, dubPath, bgmPath, "", outputPath, "replacement")
-}
-
+// MixReplacementWithSubs creates a replacement-style video with the dubbing
+// TTS (100%) and optional BGM (80%) instead of the original audio, with
+// optional burned-in subtitles.
 func (m *DubMixer) MixReplacementWithSubs(ctx context.Context, videoPath, dubPath, bgmPath, subsPath, outputPath string) error {
 	return m.mix(ctx, videoPath, dubPath, bgmPath, subsPath, outputPath, "replacement")
 }
@@ -121,27 +141,29 @@ func (m *DubMixer) buildArgs(videoPath, audioPath, bgmPath, subsPath, outputPath
 
 	var audioFilter, videoFilter, videoLabel string
 
-	var audioLabel string
-
-	if bgmExists {
+	// Audio graph rules:
+	//   - amix normalize=0 keeps each input at its own volume. The default
+	//     divides every input by the number of inputs, halving the TTS voice.
+	//   - The graph ends with apad (endless silence) and "-shortest" is set
+	//     below, so the output always lasts exactly as long as the video.
+	//     An audio track shorter than the video no longer truncates it.
+	//   - Replacement mode never reads [0:a], so it also works on videos
+	//     without an audio stream.
+	audioLabel := "[audio]"
+	switch {
+	case mode == "voiceover" && bgmExists:
 		args = append(args, "-i", bgmPath)
-		switch mode {
-		case "voiceover":
-			audioFilter = "[1:a]volume=1.0[narr];[2:a]volume=0.8[bgm];[0:a]volume=0.15[orig];[narr][bgm][orig]amix=inputs=3:duration=shortest[audio]"
-			audioLabel = "[audio]"
-		case "replacement":
-			audioFilter = "[1:a]volume=1.0[dub];[2:a]volume=0.8[bgm];[dub][bgm]amix=inputs=2:duration=shortest[audio]"
-			audioLabel = "[audio]"
-		}
-	} else {
-		switch mode {
-		case "voiceover":
-			audioFilter = "[1:a]volume=1.0[narr];[0:a]volume=0.15[orig];[narr][orig]amix=inputs=2:duration=shortest[audio]"
-			audioLabel = "[audio]"
-		case "replacement":
-			audioFilter = "[1:a]volume=1.0[dub];[0:a]volume=0[orig];[dub][orig]amix=inputs=2:duration=shortest[audio]"
-			audioLabel = "[audio]"
-		}
+		audioFilter = "[0:a]volume=0.15[orig];[1:a]volume=1.0[narr];[2:a]volume=0.8[bgm];" +
+			"[orig][narr][bgm]amix=inputs=3:duration=longest:normalize=0,apad[audio]"
+	case mode == "voiceover":
+		audioFilter = "[0:a]volume=0.15[orig];[1:a]volume=1.0[narr];" +
+			"[orig][narr]amix=inputs=2:duration=longest:normalize=0,apad[audio]"
+	case bgmExists: // replacement
+		args = append(args, "-i", bgmPath)
+		audioFilter = "[1:a]volume=1.0[dub];[2:a]volume=0.8[bgm];" +
+			"[dub][bgm]amix=inputs=2:duration=longest:normalize=0,apad[audio]"
+	default: // replacement
+		audioFilter = "[1:a]volume=1.0,apad[audio]"
 	}
 
 	if subsExists {
@@ -170,15 +192,8 @@ func (m *DubMixer) buildArgs(videoPath, audioPath, bgmPath, subsPath, outputPath
 		args = append(args, "-map", videoLabel, "-map", audioLabel)
 	}
 
-	videoEncoder := m.VideoEncoder
-	if videoEncoder == "" {
-		videoEncoder = "libopenh264"
-	}
-
+	args = append(args, videoCodecArgs(m.videoEncoder(), videoFilter != "")...)
 	args = append(args,
-		"-c:v", videoEncoder,
-		"-crf", "23",
-		"-preset", "medium",
 		"-c:a", "aac",
 		"-b:a", "192k",
 		"-movflags", "+faststart",

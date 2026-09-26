@@ -1,0 +1,10 @@
+{{range .Jobs}}
+<div class="history-item" hx-get="/jobs/{{.VideoID}}" hx-target="#pipeline-view" hx-push-url="true">
+  <span class="badge {{if eq .Status "running"}}running{{else if eq .Status "failed"}}failed{{else}}done{{end}}"></span>
+  <span title="{{.URL}}">{{.VideoID}}</span>
+  <span class="muted" style="font-size:0.7rem;margin-left:auto">{{.Mode}}</span>
+</div>
+{{end}}
+{{if not .Jobs}}
+<p class="muted" style="padding:0.4rem 0.8rem;font-size:0.8rem">No jobs yet</p>
+{{end}}

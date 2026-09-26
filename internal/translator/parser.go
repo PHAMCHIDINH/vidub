@@ -3,224 +3,124 @@ package translator
 import (
 	"encoding/json"
 	"fmt"
-	"regexp"
+	"strconv"
+	"strings"
 )
 
-// parseResponse is an internal type for unmarshalling LLM responses.
-type parseResponse struct {
-	Segments []struct {
-		Text         string `json:"text"`
-		OriginalText string `json:"original_text"`
-	} `json:"segments"`
-}
-
-// ParseTranslationResponse parses an LLM response string into TranslatedSegments.
-// It uses a 3-strategy fallback:
-//  1. Direct JSON unmarshal into a struct with Segments array.
-//  2. Regex extract the top-level JSON object ({...}) from the response.
-//  3. Regex extract a JSON array ([{...}]) from the response.
+// ParseTranslations reads an LLM response and maps each translation to its
+// input position (0-based) using the "id" field, which is the 1-based
+// position given in the prompt (see BuildUserPrompt).
 //
-// expectedCount is the number of segments expected. If non-zero, the parsed
-// segments must have at least expectedCount entries, otherwise the next
-// strategy is tried.
-func ParseTranslationResponse(response string, expectedCount int) ([]TranslatedSegment, error) {
-	if expectedCount <= 0 {
-		expectedCount = 1
+// Items without a usable id are mapped by position, but only when the
+// response has exactly n items. Positional mapping of a response with a
+// different count would shift translations onto the wrong timestamps.
+//
+// Positions the model skipped, or answered with empty text, are absent from
+// the result; the caller decides whether to ask again.
+func ParseTranslations(response string, n int) (map[int]string, error) {
+	items, err := extractItems(response)
+	if err != nil {
+		return nil, err
 	}
 
-	// Strategy 1: Direct JSON unmarshal.
-	segs, err := parseDirectJSON(response)
-	if err == nil && len(segs) >= expectedCount {
-		return segs, nil
+	out := make(map[int]string, n)
+	hasIDs := false
+	for _, it := range items {
+		if it.ID >= 1 && int(it.ID) <= n {
+			hasIDs = true
+			break
+		}
 	}
 
-	// Strategy 2: Regex extract JSON object.
-	segs, err = parseRegexObject(response)
-	if err == nil && len(segs) >= expectedCount {
-		return segs, nil
+	if hasIDs {
+		for _, it := range items {
+			idx := int(it.ID) - 1
+			text := strings.TrimSpace(it.Text)
+			if idx < 0 || idx >= n || text == "" {
+				continue // unknown id or empty answer
+			}
+			if _, dup := out[idx]; !dup {
+				out[idx] = text
+			}
+		}
+		return out, nil
 	}
 
-	// Strategy 3: Direct JSON array unmarshal (e.g. [["translated", "original"], ...])
-	segs, err = parseDirectArray(response)
-	if err == nil && len(segs) >= expectedCount {
-		return segs, nil
+	if len(items) != n {
+		return nil, fmt.Errorf("response has %d items without ids, expected %d", len(items), n)
 	}
-
-	// Strategy 4: Regex extract JSON array.
-	segs, err = parseRegexArray(response)
-	if err == nil && len(segs) >= expectedCount {
-		return segs, nil
+	for i, it := range items {
+		if text := strings.TrimSpace(it.Text); text != "" {
+			out[i] = text
+		}
 	}
-
-	// Attempt one more time with a relaxed approach: try strategies again
-	// without count validation.
-	segs, err = parseDirectJSON(response)
-	if err == nil && len(segs) > 0 {
-		return segs, nil
-	}
-
-	segs, err = parseDirectArray(response)
-	if err == nil && len(segs) > 0 {
-		return segs, nil
-	}
-
-	segs, err = parseRegexObject(response)
-	if err == nil && len(segs) > 0 {
-		return segs, nil
-	}
-
-	segs, err = parseRegexArray(response)
-	if err == nil && len(segs) > 0 {
-		return segs, nil
-	}
-
-	return nil, fmt.Errorf("unable to parse translation response: all 4 strategies failed; expected %d segments", expectedCount)
+	return out, nil
 }
 
-// parseDirectJSON attempts to unmarshal the response directly as a JSON object
-// containing a "segments" array.
-func parseDirectJSON(response string) ([]TranslatedSegment, error) {
-	var pr parseResponse
-	if err := json.Unmarshal([]byte(response), &pr); err != nil {
-		return nil, fmt.Errorf("direct JSON parse failed: %w", err)
-	}
-	if len(pr.Segments) == 0 {
-		return nil, fmt.Errorf("direct JSON parse: empty segments array")
-	}
-
-	result := make([]TranslatedSegment, len(pr.Segments))
-	for i, s := range pr.Segments {
-		result[i] = TranslatedSegment{
-			Text:         s.Text,
-			OriginalText: s.OriginalText,
-		}
-	}
-	return result, nil
+// responseItem is one translated segment in the model's answer.
+type responseItem struct {
+	ID   flexInt `json:"id"`
+	Text string  `json:"text"`
 }
 
-// jsonObjectPattern matches a top-level JSON object (non-greedy, balanced braces).
-var jsonObjectPattern = regexp.MustCompile(`(?s)\{(?:[^{}]|(?:[^{}]*\{[^{}]*\}[^{}]*))*\}`)
+// flexInt accepts 3 or "3". Anything else becomes 0, meaning "no id".
+type flexInt int
 
-// parseRegexObject attempts to extract a JSON object from the response using regex,
-// then unmarshals it.
-func parseRegexObject(response string) ([]TranslatedSegment, error) {
-	matches := jsonObjectPattern.FindString(response)
-	if matches == "" {
-		return nil, fmt.Errorf("regex object extract: no JSON object found")
+func (f *flexInt) UnmarshalJSON(b []byte) error {
+	n, err := strconv.Atoi(strings.Trim(string(b), `"`))
+	if err != nil {
+		n = 0
 	}
-
-	var pr parseResponse
-	if err := json.Unmarshal([]byte(matches), &pr); err != nil {
-		return nil, fmt.Errorf("regex object parse failed: %w", err)
-	}
-	if len(pr.Segments) == 0 {
-		return nil, fmt.Errorf("regex object parse: empty segments array")
-	}
-
-	result := make([]TranslatedSegment, len(pr.Segments))
-	for i, s := range pr.Segments {
-		result[i] = TranslatedSegment{
-			Text:         s.Text,
-			OriginalText: s.OriginalText,
-		}
-	}
-	return result, nil
+	*f = flexInt(n)
+	return nil
 }
 
-// parseDirectArray attempts to unmarshal the entire response as a JSON array.
-// It tries two shapes:
-//  1. Array of {"text": "...", "original_text": "..."}
-//  2. Array of [["translated", "original"], ...]
-func parseDirectArray(response string) ([]TranslatedSegment, error) {
-	// Try shape 1: array of objects with text/original_text fields.
-	var objArray []struct {
-		Text         string `json:"text"`
-		OriginalText string `json:"original_text"`
+// extractItems finds the translation list in a response. It accepts:
+//   - {"segments": [{"id": 1, "text": "..."}]}   (the requested shape)
+//   - [{"id": 1, "text": "..."}]
+//   - [["translated", "original"], ...]
+//
+// and tolerates markdown fences or prose around the JSON.
+func extractItems(response string) ([]responseItem, error) {
+	s := strings.TrimSpace(response)
+	candidates := []string{s}
+	if i, j := strings.Index(s, "{"), strings.LastIndex(s, "}"); i >= 0 && j > i {
+		candidates = append(candidates, s[i:j+1])
 	}
-	if err := json.Unmarshal([]byte(response), &objArray); err == nil && len(objArray) > 0 {
-		result := make([]TranslatedSegment, len(objArray))
-		for i, s := range objArray {
-			result[i] = TranslatedSegment{
-				Text:         s.Text,
-				OriginalText: s.OriginalText,
-			}
-		}
-		return result, nil
+	if i, j := strings.Index(s, "["), strings.LastIndex(s, "]"); i >= 0 && j > i {
+		candidates = append(candidates, s[i:j+1])
 	}
 
-	// Try shape 2: array of [translated, original] pairs.
-	var strPairs [][]string
-	if err := json.Unmarshal([]byte(response), &strPairs); err == nil && len(strPairs) > 0 {
-		result := make([]TranslatedSegment, len(strPairs))
-		for i, pair := range strPairs {
-			translated := ""
-			original := ""
-			if len(pair) > 0 {
-				translated = pair[0]
-			}
-			if len(pair) > 1 {
-				original = pair[1]
-			}
-			result[i] = TranslatedSegment{
-				Text:         translated,
-				OriginalText: original,
-			}
+	for _, c := range candidates {
+		if items := decodeItems(c); len(items) > 0 {
+			return items, nil
 		}
-		return result, nil
 	}
-
-	return nil, fmt.Errorf("direct array parse: unable to parse as array")
+	return nil, fmt.Errorf("no translation JSON found in response (%d bytes)", len(response))
 }
 
-// jsonArrayPattern matches a JSON array containing objects or arrays.
-var jsonArrayPattern = regexp.MustCompile(`(?s)\[\s*[\[{].*?[\]}]\s*\]`)
-
-// parseRegexArray attempts to extract a JSON array from the response using regex,
-// then unmarshals it into the segments format. It tries two shapes:
-//  1. Array of {"text": "...", "original_text": "..."}
-//  2. Array of [["translated", "original"], ...]
-func parseRegexArray(response string) ([]TranslatedSegment, error) {
-	matches := jsonArrayPattern.FindString(response)
-	if matches == "" {
-		return nil, fmt.Errorf("regex array extract: no JSON array found")
+func decodeItems(s string) []responseItem {
+	var obj struct {
+		Segments []responseItem `json:"segments"`
+	}
+	if json.Unmarshal([]byte(s), &obj) == nil && len(obj.Segments) > 0 {
+		return obj.Segments
 	}
 
-	// Try shape 1: array of objects with text/original_text fields.
-	var objArray []struct {
-		Text         string `json:"text"`
-		OriginalText string `json:"original_text"`
+	var arr []responseItem
+	if json.Unmarshal([]byte(s), &arr) == nil && len(arr) > 0 {
+		return arr
 	}
-	if err := json.Unmarshal([]byte(matches), &objArray); err == nil && len(objArray) > 0 {
-		result := make([]TranslatedSegment, len(objArray))
-		for i, s := range objArray {
-			result[i] = TranslatedSegment{
-				Text:         s.Text,
-				OriginalText: s.OriginalText,
+
+	var pairs [][]string
+	if json.Unmarshal([]byte(s), &pairs) == nil && len(pairs) > 0 {
+		items := make([]responseItem, 0, len(pairs))
+		for _, p := range pairs {
+			if len(p) > 0 {
+				items = append(items, responseItem{Text: p[0]})
 			}
 		}
-		return result, nil
+		return items
 	}
-
-	// Try shape 2: array of [translated, original] pairs.
-	var strPairs [][]string
-	if err := json.Unmarshal([]byte(matches), &strPairs); err == nil && len(strPairs) > 0 {
-		result := make([]TranslatedSegment, len(strPairs))
-		for i, pair := range strPairs {
-			original := ""
-			translated := ""
-			if len(pair) > 0 {
-				translated = pair[0]
-			}
-			if len(pair) > 1 {
-				original = pair[1]
-			}
-			result[i] = TranslatedSegment{
-				Text:         translated,
-				OriginalText: original,
-			}
-		}
-		return result, nil
-	}
-
-	return nil, fmt.Errorf("regex array parse: unable to parse array content")
+	return nil
 }

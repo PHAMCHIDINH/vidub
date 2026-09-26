@@ -5,8 +5,8 @@
 
 <div id="job-form" class="card">
   <h2 style="margin-bottom:1rem;font-size:1.1rem">New Dubbing Job</h2>
-  <p class="muted" style="margin-bottom:1rem">Using <strong>Google Translate</strong> by default. Add a DeepSeek key for higher quality.</p>
-  <form hx-post="/jobs" hx-target="#pipeline-view" hx-swap="innerHTML" hx-indicator="#spinner">
+  <p class="muted" style="margin-bottom:1rem">{{if .ServerHasKey}}Using <strong>DeepSeek</strong> with the server's API key.{{else}}Using <strong>Google Translate</strong> by default. Add a DeepSeek key for higher quality.{{end}}</p>
+  <form hx-post="/jobs" hx-target="#pipeline-view" hx-swap="innerHTML" hx-push-url="true" hx-indicator="#spinner">
     <label for="url">YouTube URL</label>
     <input type="url" id="url" name="url" placeholder="https://www.youtube.com/watch?v=..." required>
 
@@ -15,7 +15,9 @@
     </div>
     <div id="advanced-opts" style="display:none">
       <label for="apikey">DeepSeek API Key <span class="muted">(optional)</span></label>
-      <input type="password" id="apikey" name="apikey" placeholder="sk-..." value="{{.APIKey}}">
+      {{/* Never render the server's key into the page: anyone who can open it could read it. */}}
+      <input type="password" id="apikey" name="apikey" autocomplete="off"
+             placeholder="{{if .ServerHasKey}}Using the server's key. Enter one to override.{{else}}sk-...{{end}}">
 
       <label for="voice">Voice</label>
       <select id="voice" name="voice">
@@ -28,6 +30,18 @@
       <option value="voiceover">Voiceover (keep original audio 15%)</option>
       <option value="replace">Replace (TTS only)</option>
     </select>
+
+    <div style="cursor:pointer;color:#58a6ff;font-size:0.85rem;margin-top:-0.5rem" onclick="var el=document.getElementById('refresh-opts');el.style.display=el.style.display==='none'?'block':'none'">
+      🔄 Force refresh steps ▾
+    </div>
+    <div id="refresh-opts" style="display:none">
+      <p class="muted" style="font-size:0.8rem;margin-bottom:0.3rem">Re-run selected steps even if cached output exists:</p>
+      <label style="font-weight:normal;display:flex;align-items:center;gap:0.4rem"><input type="checkbox" name="refresh_extract"> extract (transcript)</label>
+      <label style="font-weight:normal;display:flex;align-items:center;gap:0.4rem"><input type="checkbox" name="refresh_translate"> translate</label>
+      <label style="font-weight:normal;display:flex;align-items:center;gap:0.4rem"><input type="checkbox" name="refresh_tts"> tts (narrative + dub)</label>
+      <label style="font-weight:normal;display:flex;align-items:center;gap:0.4rem"><input type="checkbox" name="refresh_download"> download (video)</label>
+      <label style="font-weight:normal;display:flex;align-items:center;gap:0.4rem"><input type="checkbox" name="refresh_dub"> dub (voiceover + replace)</label>
+    </div>
 
     <button type="submit" class="submit-btn">Start Dubbing</button>
   </form>
